@@ -17,7 +17,7 @@ GENERATION_ELEMENT = "inBiddingZone_Domain.mRID"
 CONSUMPTION_ELEMENT = "outBiddingZone_Domain.mRID"
 
 
-def _parse_prices(xml_text, include_currency=False):
+def parse_prices(xml_text, include_currency=False):
     """Parse price series, optionally retaining each TimeSeries currency.
 
     Parameters
@@ -54,18 +54,13 @@ def _parse_prices(xml_text, include_currency=False):
     return series
 
 
-def parse_prices(xml_text):
-    """Parse day-ahead prices grouped by resolution."""
-    return _parse_prices(xml_text, include_currency=False)
-
-
 def parse_prices_with_currencies(xml_text):
     """Parse day-ahead prices and their TimeSeries currencies.
 
     A missing ``currency_Unit.name`` is represented by ``None``; no currency
     is inferred from the bidding zone.
     """
-    return _parse_prices(xml_text, include_currency=True)
+    return parse_prices(xml_text, include_currency=True)
 
 
 def parse_netpositions(xml_text):

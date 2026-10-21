@@ -34,42 +34,6 @@ URL = os.getenv("ENTSOE_ENDPOINT_URL") or "https://web-api.tp.entsoe.eu/api"
 QUARTER_MTU_SDAC_GOLIVE = pd.Timestamp('2025-10-01', tz='Europe/Amsterdam')
 
 
-def _force_day_ahead_resolution(data):
-    """Apply the SDAC resolution transition to a price Series or DataFrame."""
-    def resample_hourly(value):
-        if isinstance(value, pd.Series):
-            return value.resample('h').first()
-        prices = value['Price'].resample('h').first()
-        # Match the first valid price in each hour, including its source row's
-        # currency even when that currency is missing.
-        valid_prices = value[value['Price'].notna()]
-        currencies = valid_prices['Currency'].resample('h').agg(
-            lambda values: values.iloc[0] if len(values) else None
-        )
-        return pd.DataFrame({
-            'Price': prices,
-            'Currency': currencies.reindex(prices.index),
-        })
-
-    if data.index.max() < QUARTER_MTU_SDAC_GOLIVE:
-        return resample_hourly(data)
-
-    data_60min = data[data.index < QUARTER_MTU_SDAC_GOLIVE]
-    data_15min = data[data.index >= QUARTER_MTU_SDAC_GOLIVE]
-    return pd.concat([
-        resample_hourly(data_60min),
-        data_15min
-    ]).sort_index()
-
-
-def _deduplicate_price_currency_rows(frame: pd.DataFrame) -> pd.DataFrame:
-    """Select the last valid price and its currency from each document set."""
-    valid = frame[frame['Price'].notna()]
-    all_missing = frame[~frame.index.isin(valid.index)]
-    rows = pd.concat([valid, all_missing]).sort_index(kind='stable')
-    return rows[~rows.index.duplicated(keep='last')]
-
-
 class EntsoeRawClient:
     # noinspection LongLine
     """
@@ -1349,18 +1313,19 @@ class EntsoePandasClient(EntsoeRawClient):
             resolution = None) -> pd.DataFrame:
         """Return SDAC prices with the currency reported by ENTSO-E.
 
-        Price values are not converted. A missing currency in the source XML
-        is returned as a missing value in the ``Currency`` column.
+        Price values are returned in the reported currency and are not
+        converted.
         """
         if resolution is not None:
             with warnings.catch_warnings():
                 warnings.simplefilter("always")
                 warnings.warn('The resolution parameter is deprecated and will be removed. This function will force the right resolution', DeprecationWarning)
         area = lookup_area(country_code)
-        frame = self._query_day_ahead_prices_with_currencies(
+        frame = self._query_day_ahead_prices(
             area,
             start=start-pd.Timedelta(days=1),
-            end=end+pd.Timedelta(days=1)
+            end=end+pd.Timedelta(days=1),
+            include_currency=True
         )
         frame = frame.tz_convert(area.tz).sort_index()
         frame = frame.truncate(before=start, after=end)
@@ -1374,29 +1339,8 @@ class EntsoePandasClient(EntsoeRawClient):
             self, area: Area,
             start: pd.Timestamp,
             end: pd.Timestamp,
-            offset: int = 0) -> pd.Series:
-        return self._query_day_ahead_price_data(
-            area, start, end, offset, with_currencies=False
-        )
-
-    @year_limited
-    @documents_limited(100, deduplicate=_deduplicate_price_currency_rows)
-    def _query_day_ahead_prices_with_currencies(
-            self, area: Area,
-            start: pd.Timestamp,
-            end: pd.Timestamp,
-            offset: int = 0) -> pd.DataFrame:
-        return self._query_day_ahead_price_data(
-            area, start, end, offset, with_currencies=True
-        )
-
-    def _query_day_ahead_price_data(
-            self, area: Area,
-            start: pd.Timestamp,
-            end: pd.Timestamp,
-            offset: int,
-            with_currencies: bool):
-        """Fetch and process one day-ahead price response."""
+            offset: int = 0,
+            include_currency: bool = False) -> Union[pd.Series, pd.DataFrame]:
         text = super(EntsoePandasClient, self).query_day_ahead_prices(
             area,
             start=start,
@@ -1404,7 +1348,7 @@ class EntsoePandasClient(EntsoeRawClient):
             offset=offset,
             sequence=1 if area.name in ['DE_LU', 'AT'] else None
         )
-        parser = (parse_prices_with_currencies if with_currencies
+        parser = (parse_prices_with_currencies if include_currency
                   else parse_prices)
         series_all = parser(text)
 
@@ -1414,17 +1358,26 @@ class EntsoePandasClient(EntsoeRawClient):
         # some zones already publish in different resolution.
         # for secondary auctions published on entsoe, use the query_day_ahead_prices_local function
 
-        data = pd.concat([x for x in series_all.values() if len(x) > 0]).sort_index().tz_convert('Europe/Amsterdam')
-        if len(data) == 0:
+        series = pd.concat([x for x in series_all.values() if len(x) > 0]).sort_index().tz_convert('Europe/Amsterdam')
+        if len(series) == 0:
             raise NoMatchingDataError
-        data = _force_day_ahead_resolution(data)
+        if series.index.max() < QUARTER_MTU_SDAC_GOLIVE:
+            series = series.resample('h').first()
+        else:
+            series_60min = series[series.index < QUARTER_MTU_SDAC_GOLIVE]
+            series_15min = series[series.index >= QUARTER_MTU_SDAC_GOLIVE]
 
-        data = data.tz_convert(area.tz).sort_index()
-        data = data.truncate(before=start, after=end)
+            series = pd.concat([
+                series_60min.resample('h').first(),
+                series_15min
+            ]).sort_index()
+
+        series = series.tz_convert(area.tz).sort_index()
+        series = series.truncate(before=start, after=end)
         # because of the above fix we need to check again if any valid data exists after truncating
-        if len(data) == 0:
+        if len(series) == 0:
             raise NoMatchingDataError
-        return data
+        return series
 
     # we need to do offset, but we also want to pad the days so wrap it in an internal call
     def query_intraday_prices(

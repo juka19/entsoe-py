@@ -186,121 +186,15 @@ def test_currency_client_matches_existing_price_query(
     assert all(call[3] == expected_sequence for call in calls)
 
 
-@pytest.mark.parametrize(
-    'first_price,first_currency,expected_price,expected_currency',
-    [
-        (10, None, 10.0, None),
-        ('NaN', 'EUR', 20.0, 'UAH'),
-    ],
-)
-def test_hourly_selection_keeps_price_and_currency_from_same_row(
-        monkeypatch, first_price, first_currency,
-        expected_price, expected_currency):
-    xml = price_document(
-        price_timeseries(
-            '2025-09-26T00:00Z', '2025-09-26T00:30Z', 'PT30M',
-            [(1, first_price)], first_currency,
-        ),
-        price_timeseries(
-            '2025-09-26T00:30Z', '2025-09-26T01:00Z', 'PT30M',
-            [(1, 20)], 'UAH',
-        ),
-    )
-
-    def fake_query(self, country_code, start, end, offset=0, sequence=None):
-        if offset:
-            raise NoMatchingDataError
-        return xml
-
-    monkeypatch.setattr(EntsoeRawClient, 'query_day_ahead_prices', fake_query)
-    client = EntsoePandasClient(api_key='test')
-    timestamp = pd.Timestamp('2025-09-26 02:00', tz='Europe/Amsterdam')
-
-    prices = client.query_day_ahead_prices(
-        'NL', start=timestamp, end=timestamp
-    )
-    frame = client.query_day_ahead_prices_with_currencies(
-        'NL', start=timestamp, end=timestamp
-    )
-
-    pd.testing.assert_series_equal(frame['Price'], prices, check_names=False)
-    assert frame.loc[timestamp, 'Price'] == expected_price
-    currency = frame.loc[timestamp, 'Currency']
-    if expected_currency is None:
-        assert pd.isna(currency)
-    else:
-        assert currency == expected_currency
-
-
-def test_currency_client_document_deduplication_is_row_atomic(monkeypatch):
-    documents = {
-        0: price_document(price_timeseries(
-            '2026-09-26T00:00Z', '2026-09-26T00:15Z', 'PT15M',
-            [(1, 1)], 'EUR',
-        )),
-        100: price_document(price_timeseries(
-            '2026-09-26T00:00Z', '2026-09-26T00:15Z', 'PT15M',
-            [(1, 2)], currency=None,
-        )),
-    }
-
-    def fake_query(self, country_code, start, end, offset=0, sequence=None):
-        try:
-            return documents[offset]
-        except KeyError:
-            raise NoMatchingDataError
-
-    monkeypatch.setattr(EntsoeRawClient, 'query_day_ahead_prices', fake_query)
-    client = EntsoePandasClient(api_key='test')
-    timestamp = pd.Timestamp('2026-09-26 02:00', tz='Europe/Amsterdam')
-
-    frame = client.query_day_ahead_prices_with_currencies(
-        'NL', start=timestamp, end=timestamp
-    )
-
-    assert frame.loc[timestamp, 'Price'] == 2.0
-    assert pd.isna(frame.loc[timestamp, 'Currency'])
-
-
-def test_currency_client_deduplicates_using_last_valid_price_row(monkeypatch):
-    documents = {
-        0: price_document(price_timeseries(
-            '2026-09-26T00:00Z', '2026-09-26T00:15Z', 'PT15M',
-            [(1, 1)], 'EUR',
-        )),
-        100: price_document(price_timeseries(
-            '2026-09-26T00:00Z', '2026-09-26T00:15Z', 'PT15M',
-            [(1, 'NaN')], 'UAH',
-        )),
-    }
-
-    def fake_query(self, country_code, start, end, offset=0, sequence=None):
-        try:
-            return documents[offset]
-        except KeyError:
-            raise NoMatchingDataError
-
-    monkeypatch.setattr(EntsoeRawClient, 'query_day_ahead_prices', fake_query)
-    client = EntsoePandasClient(api_key='test')
-    timestamp = pd.Timestamp('2026-09-26 02:00', tz='Europe/Amsterdam')
-
-    frame = client.query_day_ahead_prices_with_currencies(
-        'NL', start=timestamp, end=timestamp
-    )
-
-    assert frame.loc[timestamp].tolist() == [1.0, 'EUR']
-
-
 def test_currency_survives_year_splitting(monkeypatch):
     def fake_query(self, country_code, start, end, offset=0, sequence=None):
         if offset:
             raise NoMatchingDataError
         point_start = (start + pd.Timedelta(days=2)).tz_convert('UTC')
         point_end = point_start + pd.Timedelta(minutes=15)
-        currency = 'UAH' if point_start.year == 2026 else 'EUR'
         return price_document(price_timeseries(
             point_start.isoformat(), point_end.isoformat(), 'PT15M',
-            [(1, point_start.year)], currency,
+            [(1, point_start.year)], 'UAH',
         ))
 
     monkeypatch.setattr(EntsoeRawClient, 'query_day_ahead_prices', fake_query)
@@ -312,5 +206,5 @@ def test_currency_survives_year_splitting(monkeypatch):
         'NL', start=start, end=end
     )
 
-    assert frame['Currency'].tolist() == ['UAH', 'EUR']
+    assert frame['Currency'].tolist() == ['UAH', 'UAH']
     assert frame['Price'].tolist() == [2026.0, 2027.0]

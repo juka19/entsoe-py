@@ -59,11 +59,10 @@ def paginated(func):
     return pagination_wrapper
 
 
-def documents_limited(n, deduplicate=None):
+def documents_limited(n):
     def decorator(func):
         """Deals with calls where you cannot query more than n documents at a
-        time, by offsetting per n documents. ``deduplicate`` can select whole
-        rows when a result's columns must stay together."""
+        time, by offsetting per n documents"""
 
         @wraps(func)
         def documents_wrapper(*args, **kwargs):
@@ -86,10 +85,7 @@ def documents_limited(n, deduplicate=None):
             if func.__name__ != '_query_unavailability':
                 # For same indices pick last valid value
                 if df.index.has_duplicates:
-                    if deduplicate is None:
-                        df = df.groupby(df.index).agg(deduplicate_documents_limited)
-                    else:
-                        df = deduplicate(df)
+                    df = df.groupby(df.index).agg(deduplicate_documents_limited)
             return df
         return documents_wrapper
     return decorator
