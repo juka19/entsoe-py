@@ -144,7 +144,12 @@ def test_parse_overlapping_timeseries_keeps_price_currency_pairs():
     assert frame.index.has_duplicates
 
 
-def test_currency_client_matches_existing_price_query(monkeypatch):
+@pytest.mark.parametrize(
+    'country_code,expected_sequence',
+    [('NL', None), ('DE_LU', 1), ('AT', 1)],
+)
+def test_currency_client_matches_existing_price_query(
+        monkeypatch, country_code, expected_sequence):
     xml = price_document(price_timeseries(
         '2026-09-26T00:00Z', '2026-09-26T01:00Z', 'PT15M',
         [(1, 1), (2, 2), (3, 3), (4, 4)], 'UAH',
@@ -162,11 +167,13 @@ def test_currency_client_matches_existing_price_query(monkeypatch):
     start = pd.Timestamp('2026-09-26 02:00', tz='Europe/Amsterdam')
     end = pd.Timestamp('2026-09-26 02:30', tz='Europe/Amsterdam')
 
-    prices = client.query_day_ahead_prices('NL', start=start, end=end)
+    prices = client.query_day_ahead_prices(
+        country_code, start=start, end=end
+    )
     existing_call_count = len(calls)
     calls.clear()
     frame = client.query_day_ahead_prices_with_currencies(
-        'NL', start=start, end=end
+        country_code, start=start, end=end
     )
 
     assert frame.columns.tolist() == ['Price', 'Currency']
@@ -176,6 +183,53 @@ def test_currency_client_matches_existing_price_query(monkeypatch):
     assert len(calls) == existing_call_count
     assert calls[0][0] == start - pd.Timedelta(days=1)
     assert calls[0][1] == end + pd.Timedelta(days=1)
+    assert all(call[3] == expected_sequence for call in calls)
+
+
+@pytest.mark.parametrize(
+    'first_price,first_currency,expected_price,expected_currency',
+    [
+        (10, None, 10.0, None),
+        ('NaN', 'EUR', 20.0, 'UAH'),
+    ],
+)
+def test_hourly_selection_keeps_price_and_currency_from_same_row(
+        monkeypatch, first_price, first_currency,
+        expected_price, expected_currency):
+    xml = price_document(
+        price_timeseries(
+            '2025-09-26T00:00Z', '2025-09-26T00:30Z', 'PT30M',
+            [(1, first_price)], first_currency,
+        ),
+        price_timeseries(
+            '2025-09-26T00:30Z', '2025-09-26T01:00Z', 'PT30M',
+            [(1, 20)], 'UAH',
+        ),
+    )
+
+    def fake_query(self, country_code, start, end, offset=0, sequence=None):
+        if offset:
+            raise NoMatchingDataError
+        return xml
+
+    monkeypatch.setattr(EntsoeRawClient, 'query_day_ahead_prices', fake_query)
+    client = EntsoePandasClient(api_key='test')
+    timestamp = pd.Timestamp('2025-09-26 02:00', tz='Europe/Amsterdam')
+
+    prices = client.query_day_ahead_prices(
+        'NL', start=timestamp, end=timestamp
+    )
+    frame = client.query_day_ahead_prices_with_currencies(
+        'NL', start=timestamp, end=timestamp
+    )
+
+    pd.testing.assert_series_equal(frame['Price'], prices, check_names=False)
+    assert frame.loc[timestamp, 'Price'] == expected_price
+    currency = frame.loc[timestamp, 'Currency']
+    if expected_currency is None:
+        assert pd.isna(currency)
+    else:
+        assert currency == expected_currency
 
 
 def test_currency_client_document_deduplication_is_row_atomic(monkeypatch):

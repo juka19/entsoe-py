@@ -34,24 +34,22 @@ URL = os.getenv("ENTSOE_ENDPOINT_URL") or "https://web-api.tp.entsoe.eu/api"
 QUARTER_MTU_SDAC_GOLIVE = pd.Timestamp('2025-10-01', tz='Europe/Amsterdam')
 
 
-def _resample_price_currency_frame(frame: pd.DataFrame) -> pd.DataFrame:
-    """Resample prices without selecting currency independently from price."""
-    prices = frame['Price'].resample('h').first()
-    valid_price_rows = frame[frame['Price'].notna()]
-    currencies = valid_price_rows['Currency'].resample('h').agg(
-        lambda values: values.iloc[0] if len(values) else None
-    ).reindex(prices.index)
-    return pd.DataFrame({'Price': prices, 'Currency': currencies})
-
-
 def _force_day_ahead_resolution(data):
     """Apply the SDAC resolution transition to a price Series or DataFrame."""
-    is_currency_frame = isinstance(data, pd.DataFrame)
-
     def resample_hourly(value):
-        if is_currency_frame:
-            return _resample_price_currency_frame(value)
-        return value.resample('h').first()
+        if isinstance(value, pd.Series):
+            return value.resample('h').first()
+        prices = value['Price'].resample('h').first()
+        # Match the first valid price in each hour, including its source row's
+        # currency even when that currency is missing.
+        valid_prices = value[value['Price'].notna()]
+        currencies = valid_prices['Currency'].resample('h').agg(
+            lambda values: values.iloc[0] if len(values) else None
+        )
+        return pd.DataFrame({
+            'Price': prices,
+            'Currency': currencies.reindex(prices.index),
+        })
 
     if data.index.max() < QUARTER_MTU_SDAC_GOLIVE:
         return resample_hourly(data)
@@ -63,6 +61,13 @@ def _force_day_ahead_resolution(data):
         data_15min
     ]).sort_index()
 
+
+def _deduplicate_price_currency_rows(frame: pd.DataFrame) -> pd.DataFrame:
+    """Select the last valid price and its currency from each document set."""
+    valid = frame[frame['Price'].notna()]
+    all_missing = frame[~frame.index.isin(valid.index)]
+    rows = pd.concat([valid, all_missing]).sort_index(kind='stable')
+    return rows[~rows.index.duplicated(keep='last')]
 
 
 class EntsoeRawClient:
@@ -1370,6 +1375,28 @@ class EntsoePandasClient(EntsoeRawClient):
             start: pd.Timestamp,
             end: pd.Timestamp,
             offset: int = 0) -> pd.Series:
+        return self._query_day_ahead_price_data(
+            area, start, end, offset, with_currencies=False
+        )
+
+    @year_limited
+    @documents_limited(100, deduplicate=_deduplicate_price_currency_rows)
+    def _query_day_ahead_prices_with_currencies(
+            self, area: Area,
+            start: pd.Timestamp,
+            end: pd.Timestamp,
+            offset: int = 0) -> pd.DataFrame:
+        return self._query_day_ahead_price_data(
+            area, start, end, offset, with_currencies=True
+        )
+
+    def _query_day_ahead_price_data(
+            self, area: Area,
+            start: pd.Timestamp,
+            end: pd.Timestamp,
+            offset: int,
+            with_currencies: bool):
+        """Fetch and process one day-ahead price response."""
         text = super(EntsoePandasClient, self).query_day_ahead_prices(
             area,
             start=start,
@@ -1377,7 +1404,9 @@ class EntsoePandasClient(EntsoeRawClient):
             offset=offset,
             sequence=1 if area.name in ['DE_LU', 'AT'] else None
         )
-        series_all = parse_prices(text)
+        parser = (parse_prices_with_currencies if with_currencies
+                  else parse_prices)
+        series_all = parser(text)
 
         # This function should only return SDAC prices, which have a fixed defined resolution
         # before 2025-10-01 its 60min, after 15min
@@ -1385,46 +1414,17 @@ class EntsoePandasClient(EntsoeRawClient):
         # some zones already publish in different resolution.
         # for secondary auctions published on entsoe, use the query_day_ahead_prices_local function
 
-        series = pd.concat([x for x in series_all.values() if len(x) > 0]).sort_index().tz_convert('Europe/Amsterdam')
-        if len(series) == 0:
+        data = pd.concat([x for x in series_all.values() if len(x) > 0]).sort_index().tz_convert('Europe/Amsterdam')
+        if len(data) == 0:
             raise NoMatchingDataError
-        series = _force_day_ahead_resolution(series)
+        data = _force_day_ahead_resolution(data)
 
-        series = series.tz_convert(area.tz).sort_index()
-        series = series.truncate(before=start, after=end)
+        data = data.tz_convert(area.tz).sort_index()
+        data = data.truncate(before=start, after=end)
         # because of the above fix we need to check again if any valid data exists after truncating
-        if len(series) == 0:
+        if len(data) == 0:
             raise NoMatchingDataError
-        return series
-
-    @year_limited
-    @documents_limited(100, row_atomic=True)
-    def _query_day_ahead_prices_with_currencies(
-            self, area: Area,
-            start: pd.Timestamp,
-            end: pd.Timestamp,
-            offset: int = 0) -> pd.DataFrame:
-        text = super(EntsoePandasClient, self).query_day_ahead_prices(
-            area,
-            start=start,
-            end=end,
-            offset=offset,
-            sequence=1 if area.name in ['DE_LU', 'AT'] else None
-        )
-        frames_by_resolution = parse_prices_with_currencies(text)
-        frame = pd.concat([
-            value for value in frames_by_resolution.values() if len(value) > 0
-        ]).sort_index().tz_convert('Europe/Amsterdam')
-        if len(frame) == 0:
-            raise NoMatchingDataError
-
-        frame = _force_day_ahead_resolution(frame)
-
-        frame = frame.tz_convert(area.tz).sort_index()
-        frame = frame.truncate(before=start, after=end)
-        if len(frame) == 0:
-            raise NoMatchingDataError
-        return frame
+        return data
 
     # we need to do offset, but we also want to pad the days so wrap it in an internal call
     def query_intraday_prices(

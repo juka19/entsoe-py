@@ -28,8 +28,6 @@ def _parse_prices(xml_text, include_currency=False):
     -------
     dict[str, pd.Series | pd.DataFrame]
     """
-    empty_value = (lambda: pd.DataFrame(columns=['Price', 'Currency'])) \
-        if include_currency else (lambda: pd.Series())
     series = {
         '15min': [],
         '30min': [],
@@ -37,8 +35,9 @@ def _parse_prices(xml_text, include_currency=False):
     }
     for soup in _extract_timeseries(xml_text):
         soup_series = _parse_timeseries_generic(soup, 'price.amount')
-        currency_element = soup.find('currency_unit.name')
-        currency = currency_element.text if currency_element is not None else None
+        if include_currency:
+            currency_element = soup.find('currency_unit.name')
+            currency = currency_element.text if currency_element is not None else None
         for key in series.keys():
             parsed_series = soup_series[key]
             if include_currency and parsed_series is not None:
@@ -50,7 +49,8 @@ def _parse_prices(xml_text, include_currency=False):
         try:
             series[freq] = pd.concat(freq_series).sort_index()
         except ValueError:
-            series[freq] = empty_value()
+            series[freq] = (pd.DataFrame(columns=['Price', 'Currency'])
+                            if include_currency else pd.Series())
     return series
 
 
